@@ -204,7 +204,7 @@ def main():
     
     # Download Hurricane Helene data (2024-09-23)
     print("Downloading Hurricane Helene data...")
-    data = fetcher.download_hurricane_data("2024-08-03")
+    data = fetcher.download_hurricane_data("d)
     
     if data is not None:
         print(f"Downloaded {len(data)} records")
