@@ -184,7 +184,7 @@ class HurricaneDataFetcher:
         return dates
 
 def dataframe_to_records(df: pd.DataFrame) -> list[dict]:
-    """Convert a DataFrame to a list of records."""
+    
     if df is None or df.empty:
         return []
     # Convert timedeltas to seconds for JSON
@@ -204,7 +204,7 @@ def main():
     
     # Download Hurricane Helene data (2024-09-23)
     print("Downloading Hurricane Helene data...")
-    data = fetcher.download_hurricane_data("d)
+    data = fetcher.download_hurricane_data("2024-08-03")
     
     if data is not None:
         print(f"Downloaded {len(data)} records")
@@ -214,10 +214,9 @@ def main():
         print(data.columns.tolist())
         print(data['track_id'].unique().tolist())
         print(dataframe_to_records(data))
-        
-       
     else:
         print("Failed to download data")
+
 
 if __name__ == "__main__":
     main()
