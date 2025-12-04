@@ -91,7 +91,7 @@ def create_test_map(hurricane_tracks):
                 color=color,
                 weight=4,
                 opacity=0.8,
-                popup=f"Hurricane {track_id}"
+                popup=folium.Popup(f"Hurricane {track_id}", parse_html=False)
             ).add_to(m)
             
             # Add markers for start and end points
@@ -102,14 +102,14 @@ def create_test_map(hurricane_tracks):
                 # Start marker
                 folium.Marker(
                     start_coord,
-                    popup=f"{track_id} Start",
+                    popup=folium.Popup(f"{track_id} Start", parse_html=False),
                     icon=folium.Icon(color='green', icon='play')
                 ).add_to(m)
                 
                 # End marker
                 folium.Marker(
                     end_coord,
-                    popup=f"{track_id} End",
+                    popup=folium.Popup(f"{track_id} End", parse_html=False),
                     icon=folium.Icon(color='red', icon='stop')
                 ).add_to(m)
     
@@ -147,7 +147,8 @@ st.info("You should see 3 hurricane tracks with colored lines, green start marke
 
 try:
     test_map = create_test_map(DUMMY_HURRICANE_TRACKS)
-    st_folium(test_map, width=700, height=500)
+    # Use return_on_change=False and empty returned_objects to avoid JSON serialization issues
+    st_folium(test_map, width=700, height=500, returned_objects=[])
     st.success("✅ Map rendered successfully!")
 except Exception as e:
     st.error(f"❌ Error creating map: {e}")
