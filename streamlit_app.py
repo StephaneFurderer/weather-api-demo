@@ -5,6 +5,7 @@ Displays hurricane paths for a given date using weather-api-demo
 """
 import folium
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 from streamlit_folium import st_folium
 from datetime import datetime
@@ -20,6 +21,9 @@ from datetime import datetime, timedelta
 MAP_CENTER = [25.0, -70.0]  # Center of Atlantic region
 MAP_ZOOM = 5
 DEFAULT_MAP_TILES = 'OpenStreetMap'
+
+# Flag to force HTML rendering (set to True to bypass st_folium completely)
+FORCE_HTML_RENDERING = False
 
 
 # Page configuration
@@ -44,10 +48,24 @@ class WeatherLabAPIClient:
         """Get hurricane data for a specific date"""
         url = f"{self.base_url}/data"
         params = {"date": date}
-        response = self.client.get(url, params=params)
-        response.raise_for_status()
-        return response.json()
+        try:
+            response = self.client.get(url, params=params)
+            response.raise_for_status()
+            return response.json()
+        except httpx.ConnectError as e:
+            raise ConnectionError(f"Could not connect to API at {self.base_url}. Check your internet connection and API URL.") from e
+        except httpx.TimeoutException as e:
+            raise TimeoutError(f"API request timed out. The server at {self.base_url} may be slow or unavailable.") from e
+        except httpx.HTTPStatusError as e:
+            raise ValueError(f"API returned error {e.response.status_code}: {e.response.text}") from e
     
+    def test_connection(self) -> bool:
+        """Test if API is reachable"""
+        try:
+            response = self.client.get(f"{self.base_url}/health", timeout=5.0)
+            return response.status_code == 200
+        except Exception:
+            return False
     
     def close(self):
         """Close the HTTP client"""
@@ -55,7 +73,9 @@ class WeatherLabAPIClient:
 
 # Initialize API client in session state
 if 'weather_client' not in st.session_state:
-    st.session_state.weather_client = WeatherLabAPIClient(base_url="https://weather-lab-data-api-production.up.railway.app")
+    # Allow API URL to be configured via environment variable or use default
+    api_url = os.getenv('WEATHER_API_URL', 'https://weather-lab-data-api-production.up.railway.app')
+    st.session_state.weather_client = WeatherLabAPIClient(base_url=api_url)
 
 
 def extract_hurricane_tracks(records):
@@ -171,6 +191,23 @@ def main():
     """Main page function."""
     st.header("Hurricane Paths")
     
+    # API Configuration (in sidebar)
+    with st.sidebar.expander("⚙️ API Settings"):
+        api_url = st.text_input(
+            "API URL",
+            value=st.session_state.weather_client.base_url,
+            help="Change the API endpoint URL if needed"
+        )
+        if api_url != st.session_state.weather_client.base_url:
+            st.session_state.weather_client = WeatherLabAPIClient(base_url=api_url)
+        
+        # Test connection button
+        if st.button("🔌 Test API Connection"):
+            if st.session_state.weather_client.test_connection():
+                st.success("✅ API is reachable!")
+            else:
+                st.error("❌ Cannot reach API. Check URL and network connection.")
+    
     # Date selector
     selected_date = st.date_input(
         "Select Date",
@@ -241,8 +278,21 @@ def main():
             # Create map with hurricane tracks
             st.subheader("Hurricane Paths Map")
             paths_map = create_hurricane_paths_map(hurricane_tracks)
-            # Use return_on_change=False to avoid JSON serialization issues
-            st_folium(paths_map, width=700, height=500, returned_objects=[])
+            
+            # Render map - use HTML if FORCE_HTML_RENDERING is True or if st_folium fails
+            if FORCE_HTML_RENDERING:
+                # Direct HTML rendering - bypasses JSON serialization completely
+                map_html = paths_map._repr_html_()
+                components.html(map_html, width=700, height=500, scrolling=False)
+            else:
+                # Try st_folium first, fallback to HTML if it fails
+                try:
+                    st_folium(paths_map, width=700, height=500, returned_objects=[])
+                except Exception as e:
+                    # Fallback: render as HTML to avoid JSON serialization issues
+                    st.warning(f"Using HTML fallback due to serialization error. Set FORCE_HTML_RENDERING=True to skip st_folium.")
+                    map_html = paths_map._repr_html_()
+                    components.html(map_html, width=700, height=500, scrolling=False)
             
             # Hurricane details table
             st.subheader("Hurricane Records")

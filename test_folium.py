@@ -4,6 +4,7 @@ Lightweight test application with dummy hurricane data
 """
 import folium
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 from streamlit_folium import st_folium
 from datetime import datetime
@@ -15,6 +16,9 @@ st.set_page_config(
     page_icon="🗺️",
     layout="wide"
 )
+
+# Flag to force HTML rendering (set to True to bypass st_folium completely)
+FORCE_HTML_RENDERING = False
 
 st.title("🗺️ Folium Map Test")
 st.markdown("Testing Folium maps with dummy hurricane track data")
@@ -147,9 +151,25 @@ st.info("You should see 3 hurricane tracks with colored lines, green start marke
 
 try:
     test_map = create_test_map(DUMMY_HURRICANE_TRACKS)
-    # Use return_on_change=False and empty returned_objects to avoid JSON serialization issues
-    st_folium(test_map, width=700, height=500, returned_objects=[])
-    st.success("✅ Map rendered successfully!")
+    
+    # Render map - use HTML if FORCE_HTML_RENDERING is True or if st_folium fails
+    if FORCE_HTML_RENDERING:
+        # Direct HTML rendering - bypasses JSON serialization completely
+        map_html = test_map._repr_html_()
+        components.html(map_html, width=700, height=500, scrolling=False)
+        st.success("✅ Map rendered successfully with HTML (FORCE_HTML_RENDERING=True)!")
+    else:
+        # Try st_folium first, fallback to HTML if it fails
+        try:
+            st_folium(test_map, width=700, height=500, returned_objects=[])
+            st.success("✅ Map rendered successfully with st_folium!")
+        except Exception as folium_error:
+            # Fallback: render as HTML to avoid JSON serialization issues
+            st.warning(f"st_folium failed, using HTML fallback: {str(folium_error)[:100]}")
+            st.info("💡 Tip: Set FORCE_HTML_RENDERING=True at the top of this file to skip st_folium entirely.")
+            map_html = test_map._repr_html_()
+            components.html(map_html, width=700, height=500, scrolling=False)
+            st.success("✅ Map rendered successfully with HTML fallback!")
 except Exception as e:
     st.error(f"❌ Error creating map: {e}")
     st.exception(e)
