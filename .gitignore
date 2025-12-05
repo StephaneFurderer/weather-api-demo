@@ -1,0 +1,13 @@
+# Shapefile data - too large for git
+**/tl_2025*/
+**/*zcta*/
+**/*.shp
+**/*.shx
+**/*.dbf
+**/*.prj
+**/*.cpg
+
+# Large data files
+*.geojson
+*.json.gz
+
