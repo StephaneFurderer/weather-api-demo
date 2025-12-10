@@ -40,47 +40,60 @@ def load_county_geojson():
 
 
 def load_zip_to_fips_mapping():
-    """Load zip code to FIPS county code mapping from public dataset."""
-    try:
-        # Try multiple public sources for zip-to-FIPS mapping
-        sources = [
-            {
-                'name': 'Census ZCTA to County',
-                'url': 'https://www2.census.gov/geo/docs/maps-data/data/rel/zcta_county_rel_10.txt',
-            }
-        ]
-        
-        for source in sources:
+    """Load zip code to FIPS county code mapping from local file or public dataset."""
+    import os
+    
+    # First, try to load from local data directory (faster and more reliable)
+    local_files = [
+        'data/zip_to_fips_mapping.csv',
+        '../data/zip_to_fips_mapping.csv',
+        './data/zip_to_fips_mapping.csv'
+    ]
+    
+    for file_path in local_files:
+        if os.path.exists(file_path):
             try:
-                # Use httpx with SSL verification disabled to avoid certificate issues
-                # or use urlopen which respects the SSL context set at module level
-                
-                # Method 1: Try httpx (already imported)
-                try:
-                    response = httpx.get(source['url'], timeout=30, verify=False)
-                    response.raise_for_status()
-                    df = pd.read_csv(io.StringIO(response.text), sep=',', dtype={'ZCTA5': str, 'COUNTY': str, 'STATE': str})
-                except:
-                    # Method 2: Fallback to urlopen (respects ssl._create_default_https_context)
-                    with urlopen(source['url']) as response:
-                        df = pd.read_csv(response, sep='|', dtype={'ZCTA5': str, 'COUNTY': str, 'STATE': str})
-                
-                # Create FIPS code from STATE + COUNTY
-                if 'STATE' in df.columns and 'COUNTY' in df.columns:
-                    df['FIPS'] = (df['STATE'].astype(str).str.zfill(2) + df['COUNTY'].astype(str).str.zfill(3))
-                    zip_col = 'ZCTA5' if 'ZCTA5' in df.columns else 'ZIP'
-                    if zip_col in df.columns:
-                        df['ZIP'] = df[zip_col].astype(str).str.zfill(5)
-                        result = df[['ZIP', 'FIPS']].drop_duplicates()
-                        if not result.empty:
-                            return result
+                df = pd.read_csv(file_path, dtype={'ZIP': str, 'FIPS': str})
+                if not df.empty and 'ZIP' in df.columns and 'FIPS' in df.columns:
+                    return df[['ZIP', 'FIPS']]
             except Exception as e:
                 continue
+    
+    # If local file not found, try to download from Census Bureau
+    try:
+        url = 'https://www2.census.gov/geo/docs/maps-data/data/rel/zcta_county_rel_10.txt'
         
-        # If all sources fail, return empty DataFrame
-        return pd.DataFrame(columns=['ZIP', 'FIPS'])
+        # Method 1: Try httpx (already imported)
+        try:
+            response = httpx.get(url, timeout=60, verify=False)
+            response.raise_for_status()
+            df = pd.read_csv(io.StringIO(response.text), sep=',', dtype={'ZCTA5': str, 'COUNTY': str, 'STATE': str})
+        except:
+            # Method 2: Fallback to urlopen (respects ssl._create_default_https_context)
+            with urlopen(url) as response:
+                df = pd.read_csv(response, sep=',', dtype={'ZCTA5': str, 'COUNTY': str, 'STATE': str})
+        
+        # Create FIPS code from STATE + COUNTY
+        if 'STATE' in df.columns and 'COUNTY' in df.columns:
+            df['FIPS'] = (df['STATE'].astype(str).str.zfill(2) + df['COUNTY'].astype(str).str.zfill(3))
+            zip_col = 'ZCTA5' if 'ZCTA5' in df.columns else 'ZIP'
+            if zip_col in df.columns:
+                df['ZIP'] = df[zip_col].astype(str).str.zfill(5)
+                # Convert percentages to numeric for sorting
+                if 'ZPOPPCT' in df.columns:
+                    df['ZPOPPCT'] = pd.to_numeric(df['ZPOPPCT'], errors='coerce')
+                    # Get primary county (highest population %)
+                    result = df.sort_values('ZPOPPCT', ascending=False).groupby('ZIP').first()
+                    result = result[['FIPS']].reset_index()
+                else:
+                    result = df[['ZIP', 'FIPS']].drop_duplicates()
+                if not result.empty:
+                    return result
     except Exception as e:
-        return pd.DataFrame(columns=['ZIP', 'FIPS'])
+        pass
+    
+    # If all sources fail, return empty DataFrame
+    return pd.DataFrame(columns=['ZIP', 'FIPS'])
 
 @st.cache_data
 def fetch_hurricane_track(track_id: str, date: str) -> list:
