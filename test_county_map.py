@@ -9,6 +9,7 @@ from urllib.request import urlopen
 import json
 import ssl
 import httpx
+import io
 from datetime import datetime
 
 ssl._create_default_https_context = ssl._create_unverified_context
@@ -36,6 +37,50 @@ def load_county_geojson():
     except Exception as e:
         st.error(f"Error loading GeoJSON: {e}")
         return None
+
+
+def load_zip_to_fips_mapping():
+    """Load zip code to FIPS county code mapping from public dataset."""
+    try:
+        # Try multiple public sources for zip-to-FIPS mapping
+        sources = [
+            {
+                'name': 'Census ZCTA to County',
+                'url': 'https://www2.census.gov/geo/docs/maps-data/data/rel/zcta_county_rel_10.txt',
+            }
+        ]
+        
+        for source in sources:
+            try:
+                # Use httpx with SSL verification disabled to avoid certificate issues
+                # or use urlopen which respects the SSL context set at module level
+                
+                # Method 1: Try httpx (already imported)
+                try:
+                    response = httpx.get(source['url'], timeout=30, verify=False)
+                    response.raise_for_status()
+                    df = pd.read_csv(io.StringIO(response.text), sep=',', dtype={'ZCTA5': str, 'COUNTY': str, 'STATE': str})
+                except:
+                    # Method 2: Fallback to urlopen (respects ssl._create_default_https_context)
+                    with urlopen(source['url']) as response:
+                        df = pd.read_csv(response, sep='|', dtype={'ZCTA5': str, 'COUNTY': str, 'STATE': str})
+                
+                # Create FIPS code from STATE + COUNTY
+                if 'STATE' in df.columns and 'COUNTY' in df.columns:
+                    df['FIPS'] = (df['STATE'].astype(str).str.zfill(2) + df['COUNTY'].astype(str).str.zfill(3))
+                    zip_col = 'ZCTA5' if 'ZCTA5' in df.columns else 'ZIP'
+                    if zip_col in df.columns:
+                        df['ZIP'] = df[zip_col].astype(str).str.zfill(5)
+                        result = df[['ZIP', 'FIPS']].drop_duplicates()
+                        if not result.empty:
+                            return result
+            except Exception as e:
+                continue
+        
+        # If all sources fail, return empty DataFrame
+        return pd.DataFrame(columns=['ZIP', 'FIPS'])
+    except Exception as e:
+        return pd.DataFrame(columns=['ZIP', 'FIPS'])
 
 @st.cache_data
 def fetch_hurricane_track(track_id: str, date: str) -> list:
@@ -159,6 +204,142 @@ def get_counties_crossed(track_records: list, counties_geojson: dict) -> set:
     """Get set of FIPS codes for quick visualization."""
     df = get_counties_crossed_with_timing(track_records, counties_geojson)
     return set(df['county_fips'].tolist()) if not df.empty else set()
+
+def load_traveler_data_from_zip(df_zip_travelers: pd.DataFrame, df_zip_fips: pd.DataFrame) -> pd.DataFrame:
+    """
+    Load traveler data at zip code level and map to FIPS codes.
+    
+    Args:
+        df_zip_travelers: DataFrame with columns 'zip' (or 'zipcode'), 'date', 'expected_travelers' (or 'travelers')
+        df_zip_fips: DataFrame with columns 'ZIP' and 'FIPS' mapping
+        
+    Returns:
+        DataFrame with columns 'county_fips', 'date', 'expected_travelers' (aggregated from zip codes)
+    """
+    if df_zip_travelers.empty or df_zip_fips.empty:
+        return pd.DataFrame()
+    
+    # Normalize column names
+    zip_col = None
+    for col in df_zip_travelers.columns:
+        if col.lower() in ['zip', 'zipcode', 'zip_code', 'postal_code']:
+            zip_col = col
+            break
+    
+    if zip_col is None:
+        st.error("❌ Traveler data must contain a zip code column (zip, zipcode, zip_code, or postal_code)")
+        return pd.DataFrame()
+    
+    travelers_col = None
+    for col in df_zip_travelers.columns:
+        if col.lower() in ['expected_travelers', 'travelers', 'traveler_count', 'count']:
+            travelers_col = col
+            break
+    
+    if travelers_col is None:
+        st.error("❌ Traveler data must contain a travelers column (expected_travelers, travelers, traveler_count, or count)")
+        return pd.DataFrame()
+    
+    date_col = None
+    for col in df_zip_travelers.columns:
+        if col.lower() in ['date', 'travel_date', 'day']:
+            date_col = col
+            break
+    
+    if date_col is None:
+        st.error("❌ Traveler data must contain a date column (date, travel_date, or day)")
+        return pd.DataFrame()
+    
+    # Normalize zip codes to 5-digit strings
+    df_zip_travelers = df_zip_travelers.copy()
+    df_zip_travelers[zip_col] = df_zip_travelers[zip_col].astype(str).str.zfill(5)
+    
+    # Merge with zip-to-FIPS mapping
+    df_merged = df_zip_travelers.merge(
+        df_zip_fips,
+        left_on=zip_col,
+        right_on='ZIP',
+        how='inner'
+    )
+    
+    if df_merged.empty:
+        st.warning("⚠️ No matching zip codes found between traveler data and FIPS mapping")
+        return pd.DataFrame()
+    
+    # Aggregate by FIPS and date (sum travelers from all zip codes in a county)
+    df_aggregated = df_merged.groupby(['FIPS', date_col])[travelers_col].sum().reset_index()
+    df_aggregated.columns = ['county_fips', 'date', 'expected_travelers']
+    
+    # Ensure date is string format
+    df_aggregated['date'] = df_aggregated['date'].astype(str)
+    
+    return df_aggregated
+
+def generate_zip_code_traveler_data(county_fips_list: list, start_date: str, days: int = 7, df_zip_fips: pd.DataFrame = None) -> pd.DataFrame:
+    """
+    Generate dummy traveler data at zip code level for zip codes in the specified counties.
+    
+    Args:
+        county_fips_list: List of FIPS county codes
+        start_date: Start date in YYYY-MM-DD format
+        days: Number of days to generate data for
+        df_zip_fips: Optional zip-to-FIPS mapping DataFrame. If None, will try to load it.
+        
+    Returns:
+        DataFrame with columns 'zip', 'date', 'expected_travelers'
+    """
+    import random
+    from datetime import datetime, timedelta
+    
+    # Load zip-to-FIPS mapping if not provided
+    if df_zip_fips is None or df_zip_fips.empty:
+        df_zip_fips = load_zip_to_fips_mapping()
+    
+    if df_zip_fips.empty:
+        st.warning("⚠️ Could not load zip-to-FIPS mapping. Cannot generate zip code data.")
+        return pd.DataFrame()
+    
+    # Normalize FIPS codes to 5-digit strings
+    county_fips_set = set(str(fips).zfill(5) for fips in county_fips_list)
+    
+    # Filter zip codes that belong to the affected counties
+    df_zip_fips_filtered = df_zip_fips[df_zip_fips['FIPS'].isin(county_fips_set)].copy()
+    
+    if df_zip_fips_filtered.empty:
+        st.warning(f"⚠️ No zip codes found for counties: {county_fips_list}")
+        return pd.DataFrame()
+    
+    # Get unique zip codes
+    zip_codes = df_zip_fips_filtered['ZIP'].unique().tolist()
+    
+    start = datetime.strptime(start_date, '%Y-%m-%d')
+    data = []
+    
+    # Generate data for each zip code
+    for zip_code in zip_codes:
+        # Base travelers per zip code (realistic range: 50-5000)
+        # Smaller than county-level since zip codes are smaller geographic areas
+        base_travelers = random.randint(50, 5000)
+        
+        for day_offset in range(days):
+            date = start + timedelta(days=day_offset)
+            # Add some daily variation (±25% for more variation at zip level)
+            daily_variation = random.uniform(0.75, 1.25)
+            travelers = max(1, int(base_travelers * daily_variation))  # Ensure at least 1
+            
+            data.append({
+                'zip': zip_code,
+                'date': date.strftime('%Y-%m-%d'),
+                'expected_travelers': travelers
+            })
+    
+    df_result = pd.DataFrame(data)
+    
+    # Add some summary info
+    if not df_result.empty:
+        st.info(f"📊 Generated data for {len(zip_codes)} zip codes across {len(county_fips_set)} counties")
+    
+    return df_result
 
 def generate_traveler_data(county_fips_list: list, start_date: str, days: int = 7) -> pd.DataFrame:
     """Generate dummy traveler data per county per day."""
@@ -346,13 +527,162 @@ if counties_geojson:
             # Traveler Impact Analysis
             st.subheader("👥 Traveler Impact Analysis")
             
-            days_ahead = st.slider("Days to analyze", 1, 14, 7, help="Number of days from start date to analyze")
+            # Data source selection
+            data_source = st.radio(
+                "Traveler Data Source",
+                ["Load from Zip Code CSV", "Generate Dummy Zip Code Data", "Generate Dummy County Data"],
+                help="Choose to load real zip code data or generate dummy data for testing"
+            )
             
-            with st.spinner("Generating traveler data..."):
-                affected_fips = df_counties['county_fips'].tolist()
-                df_travelers = generate_traveler_data(affected_fips, date, days_ahead)
+            df_travelers = pd.DataFrame()
+            df_zip_travelers = pd.DataFrame()  # Store original zip-level data for scenario analysis
+            df_zip_fips = pd.DataFrame()  # Store zip-to-FIPS mapping for scenario analysis
             
-            st.success(f"✅ Generated traveler data for {len(affected_fips)} counties over {days_ahead} days")
+            if data_source == "Generate Dummy Zip Code Data":
+                st.markdown("**Generate dummy traveler data at zip code level for affected counties**")
+                days_ahead = st.slider("Days to analyze", 1, 14, 7, help="Number of days from start date to analyze", key="zip_days")
+                
+                with st.spinner("Loading zip-to-FIPS mapping and generating zip code data..."):
+                    # Load zip-to-FIPS mapping
+                    df_zip_fips = load_zip_to_fips_mapping()
+                    
+                    if not df_zip_fips.empty:
+                        affected_fips = df_counties['county_fips'].tolist()
+                        df_zip_travelers = generate_zip_code_traveler_data(affected_fips, date, days_ahead, df_zip_fips)
+                        
+                        if not df_zip_travelers.empty:
+                            # Map zip codes to FIPS for visualization
+                            df_travelers = load_traveler_data_from_zip(df_zip_travelers, df_zip_fips)
+                            st.success(f"✅ Generated zip code data: {df_zip_travelers['zip'].nunique()} zip codes → {df_travelers['county_fips'].nunique()} counties")
+                            
+                            # Show preview
+                            with st.expander("📋 Preview generated zip code data"):
+                                st.dataframe(df_zip_travelers.head(20))
+                            
+                            # Show download option
+                            csv_zip_data = df_zip_travelers.to_csv(index=False)
+                            st.download_button(
+                                "Download Zip Code Data (CSV)",
+                                csv_zip_data,
+                                f"zip_travelers_{track_id}_{date}.csv",
+                                "text/csv",
+                                key="download_zip_data"
+                            )
+                        else:
+                            st.warning("⚠️ Could not generate zip code data. Check zip-to-FIPS mapping.")
+                    else:
+                        st.warning("⚠️ Could not load zip-to-FIPS mapping. Please try uploading a mapping file.")
+                        mapping_file = st.file_uploader(
+                            "Upload zip-to-FIPS mapping CSV",
+                            type=['csv'],
+                            key="zip_fips_mapping_gen",
+                            help="CSV with columns: 'zip' (or 'ZIP') and 'fips' (or 'FIPS')"
+                        )
+                        
+                        if mapping_file is not None:
+                            df_zip_fips = pd.read_csv(mapping_file)
+                            zip_col = [c for c in df_zip_fips.columns if 'zip' in c.lower()][0] if any('zip' in c.lower() for c in df_zip_fips.columns) else None
+                            fips_col = [c for c in df_zip_fips.columns if 'fips' in c.lower()][0] if any('fips' in c.lower() for c in df_zip_fips.columns) else None
+                            
+                            if zip_col and fips_col:
+                                df_zip_fips = df_zip_fips[[zip_col, fips_col]].copy()
+                                df_zip_fips.columns = ['ZIP', 'FIPS']
+                                df_zip_fips['ZIP'] = df_zip_fips['ZIP'].astype(str).str.zfill(5)
+                                df_zip_fips['FIPS'] = df_zip_fips['FIPS'].astype(str).str.zfill(5)
+                                
+                                affected_fips = df_counties['county_fips'].tolist()
+                                df_zip_travelers = generate_zip_code_traveler_data(affected_fips, date, days_ahead, df_zip_fips)
+                                
+                                if not df_zip_travelers.empty:
+                                    df_travelers = load_traveler_data_from_zip(df_zip_travelers, df_zip_fips)
+                                    st.success(f"✅ Generated zip code data: {df_zip_travelers['zip'].nunique()} zip codes → {df_travelers['county_fips'].nunique()} counties")
+            
+            elif data_source == "Load from Zip Code CSV":
+                st.markdown("**Upload CSV with zip code level traveler data**")
+                st.info("💡 **Expected format:** CSV with columns: `zip` (or `zipcode`), `date` (YYYY-MM-DD), `expected_travelers` (or `travelers`)")
+                
+                uploaded_file = st.file_uploader(
+                    "Choose CSV file",
+                    type=['csv'],
+                    help="Upload a CSV file with zip code, date, and traveler count columns"
+                )
+                
+                if uploaded_file is not None:
+                    try:
+                        df_zip_travelers = pd.read_csv(uploaded_file)
+                        st.success(f"✅ Loaded {len(df_zip_travelers)} rows from CSV")
+                        
+                        # Show preview
+                        with st.expander("📋 Preview uploaded data"):
+                            st.dataframe(df_zip_travelers.head(10))
+                        
+                        # Load zip-to-FIPS mapping
+                        with st.spinner("Loading zip code to FIPS mapping..."):
+                            df_zip_fips = load_zip_to_fips_mapping()
+                        
+                        if not df_zip_fips.empty:
+                            st.success(f"✅ Loaded {len(df_zip_fips)} zip-to-FIPS mappings")
+                            
+                            # Map zip codes to FIPS
+                            with st.spinner("Mapping zip codes to FIPS codes..."):
+                                df_travelers = load_traveler_data_from_zip(df_zip_travelers, df_zip_fips)
+                            
+                            if not df_travelers.empty:
+                                st.success(f"✅ Mapped to {df_travelers['county_fips'].nunique()} counties")
+                                
+                                # Show mapping summary
+                                matched_zips = len(df_zip_travelers.merge(
+                                    df_zip_fips,
+                                    left_on=df_zip_travelers.columns[df_zip_travelers.columns.str.lower().str.contains('zip')][0] if any(df_zip_travelers.columns.str.lower().str.contains('zip')) else None,
+                                    right_on='ZIP',
+                                    how='inner'
+                                ))
+                                st.info(f"📊 Matched {matched_zips} zip code records to counties")
+                            else:
+                                st.warning("⚠️ No traveler data could be mapped to counties. Check zip code format.")
+                        else:
+                            # Allow manual upload of zip-to-FIPS mapping
+                            st.warning("⚠️ Could not load zip-to-FIPS mapping from public source")
+                            st.markdown("**Upload zip-to-FIPS mapping CSV**")
+                            mapping_file = st.file_uploader(
+                                "Upload zip-to-FIPS mapping CSV",
+                                type=['csv'],
+                                key="zip_fips_mapping",
+                                help="CSV with columns: 'zip' (or 'ZIP') and 'fips' (or 'FIPS')"
+                            )
+                            
+                            if mapping_file is not None:
+                                df_zip_fips = pd.read_csv(mapping_file)
+                                # Normalize column names
+                                zip_col = [c for c in df_zip_fips.columns if 'zip' in c.lower()][0] if any('zip' in c.lower() for c in df_zip_fips.columns) else None
+                                fips_col = [c for c in df_zip_fips.columns if 'fips' in c.lower()][0] if any('fips' in c.lower() for c in df_zip_fips.columns) else None
+                                
+                                if zip_col and fips_col:
+                                    df_zip_fips = df_zip_fips[[zip_col, fips_col]].copy()
+                                    df_zip_fips.columns = ['ZIP', 'FIPS']
+                                    df_zip_fips['ZIP'] = df_zip_fips['ZIP'].astype(str).str.zfill(5)
+                                    df_zip_fips['FIPS'] = df_zip_fips['FIPS'].astype(str).str.zfill(5)
+                                    
+                                    with st.spinner("Mapping zip codes to FIPS codes..."):
+                                        df_travelers = load_traveler_data_from_zip(df_zip_travelers, df_zip_fips)
+                                    
+                                    if not df_travelers.empty:
+                                        st.success(f"✅ Mapped to {df_travelers['county_fips'].nunique()} counties")
+                    except Exception as e:
+                        st.error(f"❌ Error loading CSV: {e}")
+                        st.info("💡 Make sure your CSV has the correct format: zip, date, expected_travelers")
+            
+            else:  # Generate dummy data
+                days_ahead = st.slider("Days to analyze", 1, 14, 7, help="Number of days from start date to analyze")
+                
+                with st.spinner("Generating traveler data..."):
+                    affected_fips = df_counties['county_fips'].tolist()
+                    df_travelers = generate_traveler_data(affected_fips, date, days_ahead)
+                
+                st.success(f"✅ Generated traveler data for {len(affected_fips)} counties over {days_ahead} days")
+            
+            if df_travelers.empty:
+                st.warning("⚠️ No traveler data available. Please load zip code data or generate dummy data.")
             
             # Calculate impacted travelers
             df_impact = calculate_impacted_travelers(df_counties, df_travelers)
@@ -432,9 +762,31 @@ if counties_geojson:
                 
                 if st.button("Run What-If Scenario"):
                     with st.spinner(f"Generating scenario for {scenario_date}..."):
-                        # Generate traveler data for scenario date
                         scenario_start = scenario_date.strftime('%Y-%m-%d')
-                        df_travelers_scenario = generate_traveler_data(affected_fips, scenario_start, days_ahead)
+                        
+                        # Handle scenario data based on original data source
+                        if (data_source in ["Load from Zip Code CSV", "Generate Dummy Zip Code Data"] and 
+                            not df_zip_travelers.empty and not df_zip_fips.empty):
+                            # For zip code data, adjust dates but keep same zip-to-FIPS mapping
+                            # We need to shift dates in the original zip data
+                            df_zip_travelers_scenario = df_zip_travelers.copy()
+                            # Calculate date shift
+                            original_start = datetime.strptime(date, '%Y-%m-%d')
+                            scenario_start_dt = datetime.strptime(scenario_start, '%Y-%m-%d')
+                            date_shift = (scenario_start_dt - original_start).days
+                            
+                            # Shift dates
+                            date_col_name = [c for c in df_zip_travelers.columns if c.lower() in ['date', 'travel_date', 'day']][0]
+                            df_zip_travelers_scenario[date_col_name] = pd.to_datetime(df_zip_travelers_scenario[date_col_name]) + pd.Timedelta(days=date_shift)
+                            df_zip_travelers_scenario[date_col_name] = df_zip_travelers_scenario[date_col_name].dt.strftime('%Y-%m-%d')
+                            
+                            # Map to FIPS
+                            df_travelers_scenario = load_traveler_data_from_zip(df_zip_travelers_scenario, df_zip_fips)
+                        else:
+                            # Generate dummy data for scenario
+                            days_ahead = len(df_travelers['date'].unique()) if not df_travelers.empty else 7
+                            affected_fips = df_counties['county_fips'].tolist()
+                            df_travelers_scenario = generate_traveler_data(affected_fips, scenario_start, days_ahead)
                         
                         # Calculate impact with new dates
                         df_impact_scenario = calculate_impacted_travelers(
